@@ -176,13 +176,53 @@ int ForeignNativeDepthMsaa()
     const uint32_t native = NativeDepthSlot(key).load(std::memory_order_relaxed);
     return native >> 2 == key && (native & 3) != ((surface >> 16) & 3) ? int(native & 3) : -1;
 }
-// The surface's MSAA layout when the current view is another one of an MSAA surface, else -1.
-int ForeignNativeMsaa()
+// A texture-less rectangle through one view of the EDRAM (a clear) readies its bits for the pass
+// that draws there next, which can be laid out unlike the last pass that drew there: a title can
+// clear its 1x 1280x720 pass through a 4x 640x360 view while the last draw at that base and row
+// width is the previous frame's 2x composite. Scaled for the composite (2x across, 1x down) only
+// the top half was reset, and the 1x pass's lower rows kept the last frame's depth (holes in Too
+// Human's menu face). So the layout of the draw that followed each such rectangle is learned per
+// layout key and the rectangle's own MSAA mode (a pass's own clear in its own mode, at the same key,
+// must not overwrite another view's), and preferred. REGPU_NO_CLEAR_FOLLOWER=1: the last layout
+// drawn, as before.
+std::atomic<uint32_t> g_clearPending[0x1000]; // 1 << 31 | key << 2 | MSAA mode of a rectangle not followed yet
+std::atomic<uint32_t> g_clearFollower[0x1000]; // key << 4 | rectangle's MSAA mode << 2 | the follower's
+LiveSwitch g_sw_REGPU_NO_CLEAR_FOLLOWER("REGPU_NO_CLEAR_FOLLOWER");
+uint32_t ClearSlot(uint32_t key) { return (key ^ key >> 12) & 0xFFF; }
+uint32_t FollowerSlot(uint32_t key, uint32_t rectMsaa) { return (key ^ key >> 12 ^ rectMsaa * 0x555) & 0xFFF; }
+void NoteClearRect(uint32_t key, uint32_t msaa)
+{
+    std::atomic<uint32_t>& slot = g_clearPending[ClearSlot(key)];
+    const uint32_t value = 1u << 31 | key << 2 | msaa;
+    if (slot.load(std::memory_order_relaxed) != value)
+        slot.store(value, std::memory_order_relaxed);
+}
+void NoteClearFollower(uint32_t key, uint32_t msaa)
+{
+    std::atomic<uint32_t>& pending = g_clearPending[ClearSlot(key)];
+    const uint32_t p = pending.load(std::memory_order_relaxed);
+    if (!(p >> 31) || (p >> 2 & 0x1FFFFFFF) != key)
+        return;
+    pending.store(0, std::memory_order_relaxed);
+    const uint32_t rectMsaa = p & 3, value = key << 4 | rectMsaa << 2 | msaa;
+    if (g_clearFollower[FollowerSlot(key, rectMsaa)].exchange(value, std::memory_order_relaxed) != value)
+        g_nativeMsaaGeneration.fetch_add(1, std::memory_order_relaxed);
+}
+// The surface's MSAA layout when the current view is another one of an MSAA surface (or, for a
+// rectangle, of the layout that followed it last time), else -1.
+int ForeignNativeMsaa(bool rect = false)
 {
     static LiveSwitch off("REGPU_NO_FOREIGN_MSAA"); // A/B
     if (off)
         return -1;
     const uint32_t surface = gpureg::Get(0x2000 /* RB_SURFACE_INFO */), key = LayoutKey(surface);
+    if (rect && !g_sw_REGPU_NO_CLEAR_FOLLOWER)
+    {
+        const uint32_t msaa = (surface >> 16) & 3;
+        const uint32_t follower = g_clearFollower[FollowerSlot(key, msaa)].load(std::memory_order_relaxed);
+        if (follower >> 2 == (key << 2 | msaa))
+            return (follower & 3) != msaa ? int(follower & 3) : -1;
+    }
     const uint32_t native = NativeSlot(key).load(std::memory_order_relaxed);
     return native >> 2 == key && (native & 3) != ((surface >> 16) & 3) && (native & 3) != 0 ? int(native & 3) : -1;
 }
@@ -9717,22 +9757,24 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     {
         const uint32_t surface = gpureg::Get(RB_SURFACE_INFO), msaa = (surface >> 16) & 3;
         static LiveSwitch noDepthViewScale("REGPU_NO_DEPTH_VIEW_SCALE"); // A/B for the depth-layout case below
-        if ((initiator & 0x3F) != 8 || ps.info.usedTextureSlots || vs.info.usedTextureSlots)
+        const bool rect = (initiator & 0x3F) == 8 && !ps.info.usedTextureSlots && !vs.info.usedTextureSlots;
+        if (!rect)
         {
             SetNativeMsaa(LayoutKey(surface), msaa);
+            NoteClearFollower(LayoutKey(surface), msaa);
             if (gpureg::Get(0x2200 /* RB_DEPTHCONTROL */) & 7) // the draw uses the depth surface
             {
                 const uint32_t key = DepthLayoutKey(surface);
                 NativeDepthSlot(key).store(key << 2 | msaa, std::memory_order_relaxed);
             }
         }
-        else if (TallView())
+        else if (NoteClearRect(LayoutKey(surface), msaa); TallView())
         {
             const uint32_t native = (g_tallInfo >> 16) & 3;
             vc->vscale[3] = float(MsaaAcross(msaa)) / float(MsaaAcross(native));
             vc->voffset[3] = float(MsaaDown(msaa)) / float(MsaaDown(native));
         }
-        else if (const int native = ForeignNativeMsaa(); native >= 0)
+        else if (const int native = ForeignNativeMsaa(true); native >= 0)
         {
             vc->vscale[3] = float(MsaaAcross(msaa)) / float(MsaaAcross(uint32_t(native)));
             vc->voffset[3] = float(MsaaDown(msaa)) / float(MsaaDown(uint32_t(native)));
