@@ -190,8 +190,20 @@ std::atomic<uint32_t> g_clearFollower[0x1000]; // key << 4 | rectangle's MSAA mo
 LiveSwitch g_sw_REGPU_NO_CLEAR_FOLLOWER("REGPU_NO_CLEAR_FOLLOWER");
 uint32_t ClearSlot(uint32_t key) { return (key ^ key >> 12) & 0xFFF; }
 uint32_t FollowerSlot(uint32_t key, uint32_t rectMsaa) { return (key ^ key >> 12 ^ rectMsaa * 0x555) & 0xFFF; }
+// A rectangle in the layout last drawn at its key belongs to the pass in progress: a fade or overlay
+// over it, not a clear readying the next pass. Too Human's cinematics fade the 1x final pass with a
+// texture-less blended rectangle, and the next draw at that key is the next frame's 2x composite;
+// learned as a clear followed by 2x, the fade was scaled (1, 1/2) and darkened only the top half.
+// REGPU_CLEAR_FOLLOWER_OWN_PASS=1: such rectangles are followed as before (A/B).
+LiveSwitch g_sw_REGPU_CLEAR_FOLLOWER_OWN_PASS("REGPU_CLEAR_FOLLOWER_OWN_PASS");
+bool RectInOwnPass(uint32_t key, uint32_t msaa)
+{
+    return !g_sw_REGPU_CLEAR_FOLLOWER_OWN_PASS && NativeSlot(key).load(std::memory_order_relaxed) == (key << 2 | msaa);
+}
 void NoteClearRect(uint32_t key, uint32_t msaa)
 {
+    if (RectInOwnPass(key, msaa))
+        return;
     std::atomic<uint32_t>& slot = g_clearPending[ClearSlot(key)];
     const uint32_t value = 1u << 31 | key << 2 | msaa;
     if (slot.load(std::memory_order_relaxed) != value)
@@ -216,7 +228,7 @@ int ForeignNativeMsaa(bool rect = false)
     if (off)
         return -1;
     const uint32_t surface = gpureg::Get(0x2000 /* RB_SURFACE_INFO */), key = LayoutKey(surface);
-    if (rect && !g_sw_REGPU_NO_CLEAR_FOLLOWER)
+    if (rect && !g_sw_REGPU_NO_CLEAR_FOLLOWER && !RectInOwnPass(key, (surface >> 16) & 3))
     {
         const uint32_t msaa = (surface >> 16) & 3;
         const uint32_t follower = g_clearFollower[FollowerSlot(key, msaa)].load(std::memory_order_relaxed);
