@@ -333,6 +333,21 @@ float ScaleY() { return float(OutputHeight()) / float(kHeight) * g_sceneScale * 
 float ScaleWide() { return float(OutputWidth()) / float(kWidth) * g_sceneScale * PassScale(); }
 bool WidePass() { return (gpureg::Get(0x2000 /* RB_SURFACE_INFO */) & 0x3FFF) == kWidth; }
 float ScaleX() { return WidePass() ? ScaleWide() : ScaleY(); }
+// The layout each depth surface (by EDRAM base) was last depth-tested in: the pitch (bits 0-13), MSAA
+// mode (14-15), the D24FS8 flag (16), and the host scale (x and y, 1/1024ths, bits 32-47 and 48-63).
+// A depth clear by resolve sets EDRAM tiles that other depth surfaces can lie over
+// (PropagateDepthClear); this maps the tiles to the pixels the next test reads there. Written only
+// when it changes (draw workers share it).
+std::atomic<uint64_t> g_depthTestLayout[0x1000];
+void NoteDepthTestLayout(uint32_t depthBase)
+{
+    const uint32_t surface = gpureg::Get(0x2000 /* RB_SURFACE_INFO */);
+    const uint64_t packed = (surface & 0x3FFF) | ((surface >> 16) & 3) << 14 | uint64_t((gpureg::Get(0x2002 /* RB_DEPTH_INFO */) >> 16) & 1) << 16 |
+        uint64_t(std::min(65535L, std::lround(ScaleX() * 1024.0))) << 32 | uint64_t(std::min(65535L, std::lround(ScaleY() * 1024.0))) << 48;
+    std::atomic<uint64_t>& slot = g_depthTestLayout[depthBase & 0xFFF];
+    if (slot.load(std::memory_order_relaxed) != packed)
+        slot.store(packed, std::memory_order_relaxed);
+}
 LONG HostX(LONG v) { return LONG(std::lround(double(v) * ScaleX())); }
 LONG HostY(LONG v) { return LONG(std::lround(double(v) * ScaleY())); }
 D3D12_RECT ToHost(const D3D12_RECT& r)
@@ -2250,6 +2265,85 @@ void SelectSurfaces(bool force)
     }
     C().list->OMSetRenderTargets(1, &C().rtv, FALSE, &C().dsv);
     g_drawState.motionTargets = false;
+}
+
+// A depth clear value (RB_DEPTH_CLEAR's top 24 bits) as the host depth of a D24S8 or D24FS8 surface.
+float DepthClearValue(uint32_t d, bool float24)
+{
+    if (!float24)
+        return float(d) / 16777215.0f;
+    // D24FS8: 20e4 float (4-bit exponent, bias 15, 20-bit mantissa).
+    const uint32_t e = d >> 20, m = d & 0xFFFFF;
+    return std::clamp(e ? std::ldexp(1.0f + float(m) / 1048576.0f, int(e) - 15) : std::ldexp(float(m) / 1048576.0f, -14), 0.0f, 1.0f);
+}
+
+// The EDRAM is one memory: a resolve's depth clear sets its tiles for every depth surface that lies
+// over them, not only the one being resolved. Our depth surfaces are separate textures, so the
+// others are cleared here over the same tiles, in the layout each was last depth-tested in. Too
+// Human's final pass tests full-screen darkness rectangles against a depth buffer it never writes,
+// 16 tiles before the scene's: on the console those tiles are the scene's, cleared by its last
+// resolve, and the darkness covers the screen. Ours kept whatever was drawn there long before:
+// the darkness missed regions shaped like the men and debris, and the light shafts behind showed
+// through as their outlines. Rows of tiles the clear covered whole are mapped; [first, end) are
+// absolute tile indices. REGPU_NO_DEPTH_CLEAR_ALIAS=1: only the resolved surface is cleared (A/B).
+void PropagateDepthClear(uint32_t first, uint32_t end, uint32_t value)
+{
+    static LiveSwitch off("REGPU_NO_DEPTH_CLEAR_ALIAS");
+    if (off || end <= first || C().worker)
+        return;
+    std::vector<std::pair<uint32_t, Renderer::Surface*>> targets;
+    {
+        std::lock_guard surfaceLock(g_surfaceMutex);
+        for (auto& [base, surface] : g_r.depthSurfaces)
+            if (base != C().depthBase && base < end && surface.resource)
+                targets.push_back({ base, &surface });
+    }
+    for (const auto& [base, surface] : targets)
+    {
+        const uint64_t layout = g_depthTestLayout[base & 0xFFF].load(std::memory_order_relaxed);
+        if (!layout)
+            continue; // never depth-tested: nothing reads it
+        const uint32_t pitch = uint32_t(layout & 0x3FFF), msaa = uint32_t(layout >> 14) & 3;
+        const float sx = float((layout >> 32) & 0xFFFF) / 1024.0f, sy = float(layout >> 48) / 1024.0f;
+        if (!pitch || sx <= 0 || sy <= 0)
+            continue;
+        const uint32_t across = MsaaAcross(msaa), down = MsaaDown(msaa);
+        const uint32_t tilesPerRow = (pitch * across + 79) / 80;
+        const uint32_t t0 = std::max(first, base) - base, t1 = end - base;
+        if (t1 <= t0)
+            continue;
+        const LONG tileW = LONG(80 / across), tileH = LONG(16 / down), right = LONG(pitch);
+        const LONG r0 = LONG(t0 / tilesPerRow), c0 = LONG(t0 % tilesPerRow), r1 = LONG((t1 - 1) / tilesPerRow), c1 = LONG((t1 - 1) % tilesPerRow + 1);
+        D3D12_RECT guest[3];
+        UINT count = 0;
+        if (r0 == r1)
+            guest[count++] = { c0 * tileW, r0 * tileH, std::min(c1 * tileW, right), (r0 + 1) * tileH };
+        else
+        {
+            guest[count++] = { c0 * tileW, r0 * tileH, right, (r0 + 1) * tileH };
+            if (r1 > r0 + 1)
+                guest[count++] = { 0, (r0 + 1) * tileH, right, r1 * tileH };
+            guest[count++] = { 0, r1 * tileH, std::min(c1 * tileW, right), (r1 + 1) * tileH };
+        }
+        D3D12_RECT host[3];
+        UINT hostCount = 0;
+        const LONG maxW = LONG(SurfaceWidth()), maxH = LONG(SurfaceHeight());
+        for (UINT i = 0; i < count; i++)
+        {
+            const D3D12_RECT h{ std::min(maxW, LONG(std::lround(guest[i].left * sx))), std::min(maxH, LONG(std::lround(guest[i].top * sy))),
+                std::min(maxW, LONG(std::lround(guest[i].right * sx))), std::min(maxH, LONG(std::lround(guest[i].bottom * sy))) };
+            if (h.right > h.left && h.bottom > h.top)
+                host[hostCount++] = h;
+        }
+        if (!hostCount)
+            continue;
+        C().list->ClearDepthStencilView(surface->view, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+            DepthClearValue(value >> 8, (layout >> 16) & 1), UINT8(value & 0xFF), hostCount, host);
+        static LiveSwitch trace("REGPU_TRACE_CLEARS");
+        if (trace)
+            Log("resolve clear: depth %08X also clears depth surface %03X (pitch %u, msaa %u): tiles %u-%u, %u rect(s)", value, base, pitch, msaa,
+                t0, t1, hostCount);
+    }
 }
 
 // Bindless texture descriptors: one per (resource, format, dimension), kept
@@ -7141,6 +7235,16 @@ void Resolve()
         }
         const D3D12_RECT hostClear = ToHost(clearRect);
         C().list->ClearDepthStencilView(C().dsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, depth, UINT8(v & 0xFF), 1, &hostClear);
+        // The same tiles under other depth surfaces (whole rows of the surface only: a narrower clear's
+        // tiles aren't one range).
+        if (const uint32_t info = gpureg::Get(RB_SURFACE_INFO), pitch = info & 0x3FFF; pitch && clearRect.left == 0 && clearRect.right >= LONG(pitch))
+        {
+            const uint32_t msaa = (info >> 16) & 3, tilesPerRow = (pitch * MsaaAcross(msaa) + 79) / 80;
+            const uint32_t row0 = uint32_t(std::max<LONG>(clearRect.top, 0)) * MsaaDown(msaa) / 16;
+            const uint32_t row1 = (uint32_t(std::max<LONG>(clearRect.bottom, 0)) * MsaaDown(msaa) + 15) / 16;
+            const uint32_t base = gpureg::Get(RB_DEPTH_INFO) & 0xFFF;
+            PropagateDepthClear(base + row0 * tilesPerRow, std::min<uint32_t>(base + row1 * tilesPerRow, 2048), v);
+        }
         // The EDRAM is one memory: a colour surface at the depth buffer's base is the same tiles, and a
         // whole-surface clear to zero leaves them zero (transparent black). The next colour surface
         // bound at that base starts cleared (BindSurfaces). PGR4's minimap is drawn at its
@@ -9485,6 +9589,8 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     }
     BeginFrameIfNeeded();
     SelectSurfaces(false);
+    if (gpureg::Get(RB_DEPTHCONTROL) & 2) // depth tested: the layout a clear by another surface maps to (PropagateDepthClear)
+        NoteDepthTestLayout(C().depthBase);
     // Temporal upscaling: the main view's draws in the scene also write motion vectors (their
     // shaders' motion variants, once compiled; until then the draw has no motion).
     const bool cullable = (initiator & 0x3F) != 8 && (initiator & 0x3F) != 1;
