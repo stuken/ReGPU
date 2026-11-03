@@ -778,6 +778,26 @@ struct Emitter
             body = "{ float4 t = float4(ddx(" + a + "), ddy(" + a + "), ddx(" + b + "), ddy(" + b + ")); " +
                 DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
         }
+        else if (f.opcode == 19 && !getenv("REGPU_NO_TEXTURE_WEIGHTS"))
+        {
+            // getWeights: the bilinear weights a fetch at these coordinates would use, the fraction of
+            // the texel position past the footprint's first texel centre (x, y; z for 3D). Shaders that
+            // filter by hand fetch the texels point-sampled and blend them by these: Too Human's shadowed
+            // lights take four taps of the shadow map. Returned as 0, only the first tap counted and the
+            // shadow edges came out in whole texels. Point filtering has no weights; z (3D) is left 0, the
+            // depth not being passed to the shader. REGPU_NO_TEXTURE_WEIGHTS=1: 0, as before (read at
+            // translation).
+            static const char comp[] = "xyzw";
+            const std::string reg = "r[" + std::to_string(f.src) + "].";
+            const std::string c = "float2(" + reg + comp[f.srcSwizzle & 3] + ", " + reg + comp[(f.srcSwizzle >> 2) & 3] + ")";
+            const std::string slot = std::to_string(f.constIndex);
+            char texel[64];
+            snprintf(texel, sizeof(texel), "float2(%.1f, %.1f)", f.offsetX, f.offsetY);
+            body = "{ float2 tc = " + (f.denormalized ? c : c + " * float2(max(tinfo[" + slot + "].yz & 0xFFFFu, uint2(1, 1)))") + " + " + texel +
+                " - 0.5; float4 t = " + (f.magFilter == 0 ? std::string("float4(0, 0, 0, 0)") : std::string("float4(frac(tc), 0, 0)")) + "; " +
+                DestSwizzleWrite(f.dest, f.destSwizzle, "t") + "}";
+            result.usedTextureSlots |= 1u << f.constIndex;
+        }
         else
             body = DestSwizzleWrite(f.dest, f.destSwizzle, "float4(0, 0, 0, 0)"); // other texture queries
         if (f.predicated)
