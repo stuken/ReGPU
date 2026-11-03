@@ -6898,8 +6898,20 @@ void Resolve()
         // (Only for a rectangle narrower than the image: full-width rows are a tall pass's tiles, which
         // FH1's scene resolves are too, at the tile's own row.)
         const bool placedInImage = imageBase && rect.top > 0 && uint32_t(rect.bottom) <= declaredHeight && uint32_t(rect.right - rect.left) < pitch;
+        // A tile to the right of the first (tiles side by side: Too Human's 1280x720 scene as two 640x720
+        // tiles) is copied to the image's address at its top-left column, as a tile below the first is at
+        // its row: the destination base is the image's own plus the tiled offset of (left, top). Without
+        // this the right tile became an image of its own, nothing sampled it, and the right half of the
+        // screen came out black. Tile columns are 32-pixel aligned (the tiled layout's macro tiles).
+        // REGPU_NO_TILE_COLUMNS=1: rows only, as before (A/B).
+        static LiveSwitch noTileColumns("REGPU_NO_TILE_COLUMNS");
+        const bool tileColumn = !noTileColumns && !placedInImage && rect.left > 0 && (rect.left & 31) == 0 && (rect.top & 31) == 0 &&
+            uint32_t(rect.right) <= pitch && guestBpp <= 16;
+        const uint32_t tileOffset = tileColumn
+            ? TextureTiledOffset(uint32_t(rect.left), uint32_t(rect.top), (pitch + 31) & ~31u, guestBpp == 1 ? 0 : guestBpp == 2 ? 1 : guestBpp == 4 ? 2 : guestBpp == 8 ? 3 : 4)
+            : uint32_t(rect.top) * pitch * (noTileBpp ? 4 : guestBpp);
         const uint32_t base = placedInImage ? gpureg::Get(RB_COPY_DEST_BASE) & 0x1FFFFFFF
-                                            : ((gpureg::Get(RB_COPY_DEST_BASE) & 0x1FFFFFFF) - uint32_t(rect.top) * pitch * (noTileBpp ? 4 : guestBpp)) & 0x1FFFFFFF;
+                                            : ((gpureg::Get(RB_COPY_DEST_BASE) & 0x1FFFFFFF) - tileOffset) & 0x1FFFFFFF;
         const uint32_t width = std::clamp<uint32_t>(pitch, 1, std::max<uint32_t>(kWidth, BigPassSize()));
         // Taller than the screen is possible: a 1024x1024 target drawn as tall passes is resolved
         // 720 rows at a time and sampled as 1024 rows. The texture keeps all its rows (clamped to
