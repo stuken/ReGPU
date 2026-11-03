@@ -11357,7 +11357,9 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     // REGPU_DUMP_RESOLVES=1 (with REGPU_DUMP_FRAME): also write every resolved texture to out/res.
     static std::vector<ResolveDump> resolveDumps;
     resolveDumps.clear();
-    if (dump && (getenv("REGPU_DUMP_RESOLVES") || (g_hotkeyFrame.load() && g_r.frame == dumpFrame)))
+    // A capture's own frame only: a debug "shot" also sets dumpFrame, and keyed on that, every shot taken
+    // after a capture wrote all the frame's resolves too (a polling script took the game to 1 fps).
+    if (dump && (getenv("REGPU_DUMP_RESOLVES") || (g_hotkeyFrame.load() && g_r.frame == g_hotkeyFrame.load())))
     {
         auto add = [&](uint32_t base, ResolvedTexture& r, int variant) {
             if (!r.resource)
