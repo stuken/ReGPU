@@ -5798,6 +5798,15 @@ bool Widen(uint32_t surface, int32_t r[4])
     const Table* t = g_table.load(std::memory_order_acquire);
     if (!t || !Enabled() || (g_phase.surface == surface && g_phase.firstResolved) || g_unsafe.count(surface))
         return false;
+    // A draw with the stencil test on stays in its own tile: each later tile keeps its own copy of
+    // it (RendererTileDrop), so widened it was drawn twice over the later tiles' rows. For blended
+    // draws that is visible: Too Human's translucent fog and light shafts (additive, stencil-tested)
+    // came out brighter right of the 640-pixel tile join (82 vs 89 on a flat wall). Not widening
+    // them also keeps the stencil each tile tests its own, as the console's.
+    // (REGPU_TILE_MERGE_DROP_STENCIL=1, which drops the later copies instead, widens them as before.)
+    static LiveSwitch dropStencil("REGPU_TILE_MERGE_DROP_STENCIL");
+    if (!dropStencil && (gpureg::Get(RB_DEPTHCONTROL) & 1))
+        return false;
     for (const Entry& e : t->entries)
         if (e.surface == surface && e.first[0] == r[0] && e.first[1] == r[1] && e.first[2] == r[2] && e.first[3] == r[3])
         {
@@ -8567,7 +8576,13 @@ bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uin
             p.current = 0;
             p.counts[p.firstResolved ? 1 : 0]++;
             if (!p.firstResolved && !resolve)
+            {
                 p.drawn.Add(TileMerge::DrawKey(initiator, dmaBase, dmaSize));
+                static LiveSwitch traceKept("REGPU_TRACE_TILE_KEPT");
+                if (traceKept && g_r.frame % 300 == 0)
+                    Log("tile first: frame %llu #%u initiator %08X dma %08X+%u key %016llx", (unsigned long long)g_r.frame, p.counts[0] - 1, initiator, dmaBase,
+                        dmaSize, (unsigned long long)TileMerge::DrawKey(initiator, dmaBase, dmaSize));
+            }
             p.bases[0] = (gpureg::Get(RB_COLOR_INFO) & 0xFFF) << 16 | (gpureg::Get(RB_DEPTH_INFO) & 0xFFF);
             if (resolve)
             {
@@ -8627,11 +8642,24 @@ bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uin
                 // drawn where its stencil marks allow: with those dropped, the sky went grey for a frame
                 // now and then while the camera moved). REGPU_TILE_MERGE_DROP_STENCIL=1: dropped too (A/B).
                 static LiveSwitch dropStencil("REGPU_TILE_MERGE_DROP_STENCIL");
+                // REGPU_TRACE_TILE_KEPT=1: the later tile's draws that are kept, and why (one frame every 300).
+                static LiveSwitch traceKept("REGPU_TRACE_TILE_KEPT");
+                const bool logKept = traceKept && g_r.frame % 300 == 0;
                 if (!dropStencil && (gpureg::Get(RB_DEPTHCONTROL) & 1))
+                {
+                    if (logKept)
+                        Log("tile kept: frame %llu #%u stencil (depthctl %08X) ps %016llx", (unsigned long long)g_r.frame, number, gpureg::Get(RB_DEPTHCONTROL),
+                            (unsigned long long)C().psHash);
                     return false;
+                }
                 // Drawn by the first tile: dropped (each first-tile draw stands for one later one).
                 if (!p.drawn.Take(TileMerge::DrawKey(initiator, dmaBase, dmaSize)))
+                {
+                    if (logKept)
+                        Log("tile kept: frame %llu #%u no first-tile twin: initiator %08X dma %08X+%u key %016llx ps %016llx", (unsigned long long)g_r.frame, number,
+                            initiator, dmaBase, dmaSize, (unsigned long long)TileMerge::DrawKey(initiator, dmaBase, dmaSize), (unsigned long long)C().psHash);
                     return false;
+                }
                 static LiveSwitch traceDrops("REGPU_TRACE_TILE_DROPS"); // debug: one frame's dropped draws every 300
                 if (traceDrops && g_r.frame % 300 == 0)
                     Log("tile drop: frame %llu #%u tile %d vs %016llx ps %016llx prim %u depthctl %08X colour %03X depth %03X", (unsigned long long)g_r.frame, number, int(i) + 1,
