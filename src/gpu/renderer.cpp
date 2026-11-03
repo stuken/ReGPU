@@ -11232,8 +11232,12 @@ void PrecompileAll()
     std::vector<uint8_t> bootFrame;
     if (!(host.staticShadersSaved && host.staticShadersSaved()) && BootScreenCompose(L"PREPARING SHADERS", 0, 0, bootFrame))
         BootPresent(bootFrame);
-    for (const regpu::ScannedShader& s : host.staticShaders())
+    for (regpu::ScannedShader& s : host.staticShaders())
     {
+        // Hashed as the upload of it is (RendererPredictShader, frame.cpp): its used dwords only. A host
+        // can pass a shader's whole stored microcode (Too Human's shader containers hold a few dwords
+        // past the last instruction); hashed whole, none of them matched a shader the game draws with.
+        s.code.resize(ucode::UsedDwords(s.code.data(), uint32_t(s.code.size())));
         // The scanner accepts a candidate on control flow alone, and a few of what it finds in
         // the mesh files is not a shader (ucode::Plausible). Translating one fails on an opcode
         // the ISA doesn't define, after paying a translation on every boot.
