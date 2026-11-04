@@ -966,7 +966,22 @@ struct TexturePool
     std::unordered_map<uint64_t, std::vector<Block>> free; // by size
     std::unordered_map<ID3D12Resource*, Block> live;
     std::deque<std::pair<uint64_t, Block>> retired; // frame retired, block
+    // The next heap, made ahead on another thread (see CreateTexture).
+    std::future<ComPtr<ID3D12Heap>> spare;
 } g_texturePool;
+
+ComPtr<ID3D12Heap> NewTextureHeap()
+{
+    D3D12_HEAP_DESC hd{};
+    hd.SizeInBytes = TexturePool::kHeapBytes;
+    hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    hd.Alignment = 0x10000;
+    hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+    ComPtr<ID3D12Heap> heap;
+    if (FAILED(g_r.device->CreateHeap(&hd, IID_PPV_ARGS(&heap))))
+        heap.Reset();
+    return heap;
+}
 
 // A texture in the pool (or committed, if it does not fit a heap). Starts in `state`.
 ComPtr<ID3D12Resource> CreateTexture(const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state, const char* kind)
@@ -989,19 +1004,23 @@ ComPtr<ID3D12Resource> CreateTexture(const D3D12_RESOURCE_DESC& desc, D3D12_RESO
         {
             if (pool.used + size > TexturePool::kHeapBytes)
             {
-                D3D12_HEAP_DESC hd{};
-                hd.SizeInBytes = TexturePool::kHeapBytes;
-                hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
-                hd.Alignment = 0x10000;
-                hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
-                ComPtr<ID3D12Heap> heap;
-                Check(g_r.device->CreateHeap(&hd, IID_PPV_ARGS(&heap)), "CreateHeap(textures)");
+                // The spare made ahead if there is one (usually ready by now): creating a 128 MB heap here
+                // took ~10 ms on a Radeon 8060S, in the middle of a frame (a cut to a new shot missed a frame).
+                ComPtr<ID3D12Heap> heap = pool.spare.valid() ? pool.spare.get() : nullptr;
+                if (!heap)
+                    heap = NewTextureHeap();
+                Check(heap ? S_OK : E_OUTOFMEMORY, "CreateHeap(textures)");
                 CountCreate("texture heap");
                 pool.heaps.push_back(heap);
                 pool.used = 0;
             }
             block = { pool.heaps.back().Get(), pool.used, size };
             pool.used += size;
+            // Half full: the next heap is made on another thread meanwhile. REGPU_NO_SPARE_TEXTURE_HEAP=1:
+            // made when needed, as before (A/B).
+            static LiveSwitch noSpare("REGPU_NO_SPARE_TEXTURE_HEAP");
+            if (!noSpare && !pool.spare.valid() && pool.used > TexturePool::kHeapBytes / 2)
+                pool.spare = std::async(std::launch::async, NewTextureHeap);
         }
         if (SUCCEEDED(g_r.device->CreatePlacedResource(block.heap, block.offset, &desc, state, nullptr, IID_PPV_ARGS(&r))))
         {
@@ -2435,6 +2454,9 @@ UINT BindlessIndexLocked(ID3D12Resource* resource, DXGI_FORMAT format, uint32_t 
     srv.Format = format;
     srv.Shader4ComponentMapping = format == DXGI_FORMAT_BC4_UNORM
         ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 0, 0, 0) // DXT5A: its one channel in all four
+        : format == DXGI_FORMAT_R8_UNORM
+        // k_8: its channel in R, G and B and alpha 1, as the decoder's (t, t, t, 255)
+        ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 0, 0, D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1)
         : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     if (kind == 1)
     {
@@ -5318,8 +5340,13 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
     // DXT formats stay compressed on the GPU (BC1-BC4): no decode, a quarter to an eighth of
     // the upload. D3D12 needs block-aligned sizes; others are decoded to RGBA8.
     LiveSwitch &noNativeBC = g_sw_REGPU_NO_NATIVE_BC;
-    const uint32_t kind = TextureBCKind(fetch.Format());
-    const uint32_t bc = !noNativeBC && ((w % 4 == 0 && h % 4 == 0) || kind == 6) && !forceDecode ? kind : 0;
+    // k_8 (one byte a texel: video planes, masks) too, as R8: decoded, each texel became four bytes on the
+    // CPU, ~8 ms for a 1024x1024 image, and a cut that brought in a few of them missed a frame.
+    // REGPU_NO_NATIVE_8=1: decoded, as before (A/B).
+    static LiveSwitch noNative8("REGPU_NO_NATIVE_8");
+    const uint32_t kind = TextureBCKind(fetch.Format()) == 7 && noNative8 ? 0 : TextureBCKind(fetch.Format());
+    const bool texelBlocks = kind == 6 || kind == 7; // uncompressed: 1x1 "blocks", any size
+    const uint32_t bc = !noNativeBC && ((w % 4 == 0 && h % 4 == 0) || texelBlocks) && !forceDecode ? kind : 0;
     const uint8_t* source;
     size_t sourceBytes, hashStride;
     TextureHashSpan(fetch, w, h, source, sourceBytes, hashStride);
@@ -5371,10 +5398,11 @@ ID3D12Resource* GetTextureLocked(const TextureFetch& fetch, DXGI_FORMAT& format,
     if (bc)
     {
         static const DXGI_FORMAT bcFormats[] = { DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_BC2_UNORM, DXGI_FORMAT_BC3_UNORM,
-            DXGI_FORMAT_BC4_UNORM, DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT };
+            DXGI_FORMAT_BC4_UNORM, DXGI_FORMAT_BC5_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8_UNORM };
         const DXGI_FORMAT bcFormat = bcFormats[bc];
         // Kind 6 (16_16_16_16_FLOAT) is uncompressed: blocks of one texel, 8 bytes.
-        const uint32_t blockBytes = bc == 1 || bc == 4 || bc == 6 ? 8 : 16, bs = bc == 6 ? 1 : 4;
+        // Kind 7 (k_8): blocks of one texel, 1 byte.
+        const uint32_t blockBytes = bc == 7 ? 1 : bc == 1 || bc == 4 || bc == 6 ? 8 : 16, bs = bc == 6 || bc == 7 ? 1 : 4;
         D3D12_RESOURCE_BARRIER b{};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;

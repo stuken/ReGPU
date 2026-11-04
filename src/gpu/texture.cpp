@@ -531,6 +531,7 @@ uint32_t TextureBCKind(uint32_t format)
     case k_DXT5A: return 4;
     case k_DXN: return 5;
     case k_16_16_16_16_FLOAT: return 6; // not compressed: 1x1 "blocks" of 8 bytes
+    case k_8: return 7;                 // one byte a texel (R8, its channel in R, G and B; see renderer.cpp)
     default: return 0;
     }
 }
@@ -549,20 +550,36 @@ bool CopyTextureBlocks(const TextureFetch& fetch, uint8_t* dst, uint32_t dstRowP
         pitchBlocks = (pitchBlocks + 31) & ~31u;
     uint32_t packX, packY;
     PackedMipOffset(fetch, bs, packX, packY);
+    // Each row is gathered in cached memory and written to dst in one copy: dst is upload memory
+    // (write-combined, never read), where a write of a byte or two at a time is slow. One-byte texels
+    // (k_8) took ~8.5 ms for a 1024x1024 image written texel by texel. REGPU_COPY_TEXELS_DIRECT=1: as before.
+    static LiveSwitch direct("REGPU_COPY_TEXELS_DIRECT");
+    const bool swap = fetch.Endian() != 0 && blockBytes > 1;
+    thread_local std::vector<uint8_t> rowBuffer;
+    rowBuffer.resize(size_t(blocksX) * blockBytes);
     for (uint32_t by = 0; by < blocksY; by++)
     {
-        uint8_t* row = dst + size_t(by) * dstRowPitch;
+        uint8_t* row = direct ? dst + size_t(by) * dstRowPitch : rowBuffer.data();
         const int32_t rowOffset = fetch.Tiled() ? TiledOffset2DOuter(by + packY, pitchBlocks, info.log2Bytes) : 0;
         for (uint32_t bx = 0; bx < blocksX; bx++)
         {
             const size_t offset = fetch.Tiled() ? size_t(TiledOffset2DInner(bx + packX, by + packY, info.log2Bytes, rowOffset) >> info.log2Bytes) * blockBytes
                                                 : (size_t(by + packY) * pitchBlocks + bx + packX) * blockBytes;
-            // Swapped here, then written once: dst is upload memory (write-combined, never read).
-            uint8_t block[16];
-            memcpy(block, source + offset, blockBytes);
-            Swap(block, blockBytes, fetch.Endian());
-            memcpy(row + size_t(bx) * blockBytes, block, blockBytes);
+            uint8_t* out = row + size_t(bx) * blockBytes;
+            if (direct)
+            {
+                uint8_t block[16];
+                memcpy(block, source + offset, blockBytes);
+                Swap(block, blockBytes, fetch.Endian());
+                memcpy(out, block, blockBytes);
+                continue;
+            }
+            memcpy(out, source + offset, blockBytes);
+            if (swap)
+                Swap(out, blockBytes, fetch.Endian());
         }
+        if (!direct)
+            memcpy(dst + size_t(by) * dstRowPitch, rowBuffer.data(), rowBuffer.size());
     }
     return true;
 }
