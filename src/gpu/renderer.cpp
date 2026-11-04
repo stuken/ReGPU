@@ -11246,11 +11246,12 @@ void PrecompileAll()
             // phase's progress, not a held black frame.
             const regpu::Host& host = regpu::GetHost();
             std::vector<uint8_t> frame;
-            // Compiling only after a translator change; otherwise the stored set loading from the cache.
+            // Counted in pipelines: built (their shaders compiling first) after a translator change, else loaded
+            // from the cache.
             static bool compiled = false;
             compiled = compiled || g_compiler.jobs.load() > 0;
             if (now - start > std::chrono::seconds(2) && host.bootScreen &&
-                host.bootScreen(compiled ? L"COMPILING SHADERS" : L"LOADING SHADERS", uint32_t(nextKey), uint32_t(keys.size()), frame))
+                host.bootScreen(compiled ? L"BUILDING PIPELINES" : L"LOADING PIPELINES", uint32_t(nextKey), uint32_t(keys.size()), frame))
                 BootPresent(frame);
             else
             {
