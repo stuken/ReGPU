@@ -35,7 +35,7 @@ bool RendererTracing();
 #include <functional>
 struct RendererTile
 {
-    int32_t originY = 0;
+    int32_t originX = 0, originY = 0;
     int32_t rect[4] = { 0, 0, 1 << 14, 1 << 14 };
 };
 // Whether draws may be translated on workers now (game settled, no upscaler, ...).

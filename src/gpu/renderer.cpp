@@ -5773,14 +5773,24 @@ IndexListEntry* CachedIndexList(uint32_t initiator, uint32_t dmaBase, uint32_t d
     return e.ok ? &e : nullptr;
 }
 
-// Origin (screen rows) and screen rectangle of the tile pass being replayed.
+// Origin (screen columns and rows) and screen rectangle of the tile pass being replayed.
 struct TileState
 {
-    int originY = 0;
+    int originX = 0, originY = 0;
     D3D12_RECT rect{ 0, 0, 1 << 14, 1 << 14 };
     uint32_t surface = ~0u; // RB_SURFACE_INFO of the tiled pass (~0: any)
 };
 thread_local TileState g_tile;
+// Whether a draw's screen scissor is a tile of a tiled pass, which sets the tile tile-relative draws land in:
+// a band across the whole width (tiles in rows) or down the whole height (in columns). Small draws in a
+// tile pass are not tiles: Too Human's 16x16 draws after a tile's resolves set the origin back to the
+// first tile's, and the right tile's stencil reset after them went to the left tile.
+// REGPU_TILE_FROM_ANY_DRAW=1: any draw not covering the pass sets it, as before.
+bool TileBand(const D3D12_RECT& r, uint32_t passWidth, uint32_t passHeight)
+{
+    static LiveSwitch anyDraw("REGPU_TILE_FROM_ANY_DRAW");
+    return anyDraw || (r.left <= 0 && r.right >= LONG(passWidth)) || (r.top <= 0 && r.bottom >= LONG(passHeight));
+}
 static LiveSwitch g_noForeignTile("REGPU_NO_FOREIGN_TILE"); // A/B for the paint-editor tile fix
 
 // Tiling: each tile pass is shifted into EDRAM by the window offset and
@@ -8759,6 +8769,18 @@ bool RendererTileDrop(uint32_t surface, const int32_t rect[4], bool resolve, uin
                     return false; // not seen its first tile: draw as is
                 p.inLater = true;
                 p.current = int(i) + 1;
+                // The tile's origin, as the draw path learns it from the draws it draws: this tile's are
+                // dropped up to its first resolve, and a tile-relative draw after it (a stencil reset
+                // through another MSAA view) would otherwise be placed at the first tile's origin.
+                if (!resolve)
+                {
+                    const uint32_t offsetReg = gpureg::Get(PA_SC_WINDOW_OFFSET);
+                    const bool vertexOffset = (gpureg::Get(PA_SU_SC_MODE_CNTL) >> 16) & 1;
+                    g_tile.originX = vertexOffset ? -(int32_t(offsetReg << 17) >> 17) : 0;
+                    g_tile.originY = vertexOffset ? -(int32_t((offsetReg >> 16) << 17) >> 17) : 0;
+                    g_tile.rect = { rect[0], rect[1], rect[2], rect[3] };
+                    g_tile.surface = surface;
+                }
                 p.counts[p.laterResolved[i] ? 3 : 2]++;
                 p.bases[1] = (gpureg::Get(RB_COLOR_INFO) & 0xFFF) << 16 | (gpureg::Get(RB_DEPTH_INFO) & 0xFFF);
                 if (resolve)
@@ -9037,10 +9059,12 @@ void RendererTrackTile(RendererTile& tile)
         return;
     const D3D12_RECT scissor = WindowScissor();
     const uint32_t offsetReg = gpureg::Get(PA_SC_WINDOW_OFFSET);
-    const int32_t wy = ((gpureg::Get(PA_SU_SC_MODE_CNTL) >> 16) & 1) ? int32_t((offsetReg >> 16) << 17) >> 17 : 0;
+    const bool vertexOffset = (gpureg::Get(PA_SU_SC_MODE_CNTL) >> 16) & 1;
+    const int32_t wx = vertexOffset ? int32_t(offsetReg << 17) >> 17 : 0, wy = vertexOffset ? int32_t((offsetReg >> 16) << 17) >> 17 : 0;
     const bool full = scissor.left <= 0 && scissor.top <= 0 && scissor.right >= LONG(PassWidth()) && scissor.bottom >= LONG(PassHeight());
-    if (!full)
+    if (!full && TileBand(scissor, PassWidth(), PassHeight()))
     {
+        tile.originX = -wx;
         tile.originY = -wy;
         tile.rect[0] = scissor.left;
         tile.rect[1] = scissor.top;
@@ -9081,6 +9105,7 @@ void RendererForceTileWiden(bool set, bool widened, const int32_t rect[4])
 
 void RendererSetTile(const RendererTile& tile)
 {
+    g_tile.originX = tile.originX;
     g_tile.originY = tile.originY;
     g_tile.rect = { tile.rect[0], tile.rect[1], tile.rect[2], tile.rect[3] };
 }
@@ -10250,10 +10275,11 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // reset the window offset to zero and use tile-relative coordinates instead:
     // those land in the current tile, so shift them by the tile's origin.
     D3D12_RECT scissor = WindowScissor();
-    float shiftY = 0;
+    float shiftX = 0, shiftY = 0;
     {
         const uint32_t offsetReg = gpureg::Get(PA_SC_WINDOW_OFFSET);
-        const int32_t wy = ((gpureg::Get(PA_SU_SC_MODE_CNTL) >> 16) & 1) ? int32_t((offsetReg >> 16) << 17) >> 17 : 0;
+        const bool vertexOffset = (gpureg::Get(PA_SU_SC_MODE_CNTL) >> 16) & 1;
+        const int32_t wx = vertexOffset ? int32_t(offsetReg << 17) >> 17 : 0, wy = vertexOffset ? int32_t((offsetReg >> 16) << 17) >> 17 : 0;
         const bool full = scissor.left <= 0 && scissor.top <= 0 && scissor.right >= LONG(PassWidth()) && scissor.bottom >= LONG(PassHeight());
         // REGPU_TRACE_TILES=1: draws per frame in tile passes (by tile rectangle) and full ones.
         if (LiveSwitch &traceTiles = g_sw_REGPU_TRACE_TILES; traceTiles)
@@ -10280,9 +10306,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             else
                 byRect[{ scissor.left, scissor.top, scissor.right, scissor.bottom }]++;
         }
-        if (!full || TileMerge::t_widened)
+        if ((!full && TileBand(scissor, PassWidth(), PassHeight())) || TileMerge::t_widened)
         {
             // (A merged first tile is the tile pass now: its draws are not shifted into an older tile.)
+            g_tile.originX = -wx;
             g_tile.originY = -wy;
             g_tile.rect = scissor;
             g_tile.surface = gpureg::Get(RB_SURFACE_INFO);
@@ -10293,8 +10320,20 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         // third (the rest of the picture was black).
         // Another MSAA view of the tiled surface itself (stencil clears of a composite) is still
         // tile-relative.
-        else if (g_tile.originY != 0 && (g_tile.surface == ~0u || g_tile.surface == gpureg::Get(RB_SURFACE_INFO) || (!g_noForeignTile && ForeignNativeMsaa() >= 0)))
+        // Tiles can be columns as well as rows (Too Human draws its 1280x720 scene as two 640x720
+        // tiles side by side): such a draw in the right tile lands right of the tile's origin too.
+        // Shifted only down, the right tile's stencil reset (a rectangle through a 4x view, before its
+        // shadow pass) fell on the left tile and was clipped away; the right tile's shadow pass then
+        // tested the stencil its scene left, and the right half of the screen had no shadows (a
+        // vertical line down the middle, lighter right of it). REGPU_NO_TILE_COLUMN_SHIFT=1: rows only.
+        else if (!full)
+            ; // a small draw (not a tile): drawn where it is, as before
+        else if ((g_tile.originX != 0 || g_tile.originY != 0) &&
+                 (g_tile.surface == ~0u || g_tile.surface == gpureg::Get(RB_SURFACE_INFO) || (!g_noForeignTile && ForeignNativeMsaa() >= 0)))
         {
+            static LiveSwitch rowsOnly("REGPU_NO_TILE_COLUMN_SHIFT");
+            if (!rowsOnly)
+                shiftX = float(g_tile.originX + wx);
             shiftY = float(g_tile.originY + wy);
             scissor.left = std::max(scissor.left, g_tile.rect.left);
             scissor.top = std::max(scissor.top, g_tile.rect.top);
@@ -10302,7 +10341,7 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
             scissor.bottom = std::min(scissor.bottom, g_tile.rect.bottom);
         }
     }
-    const D3D12_VIEWPORT vp{ 0, shiftY * ScaleY(), float(PassWidth()) * ScaleX(), float(PassHeight()) * ScaleY(), 0, 1 };
+    const D3D12_VIEWPORT vp{ shiftX * ScaleX(), shiftY * ScaleY(), float(PassWidth()) * ScaleX(), float(PassHeight()) * ScaleY(), 0, 1 };
     if (scissor.right <= scissor.left || scissor.bottom <= scissor.top)
     {
         TraceSkip("empty scissor", initiator);

@@ -467,6 +467,10 @@ void SubmitDraw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     if (g_gpu.dropDraws)
     {
         g_gpu.droppedDraws++;
+        // Still this tile's draw: the draws the workers replay after its first resolve (a stencil reset
+        // drawn tile-relative) take their tile's origin from here.
+        if (seg::Enabled())
+            RendererTrackTile(seg::g_tile);
         return;
     }
     if (seg::Enabled())
