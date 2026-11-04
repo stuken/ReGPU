@@ -16,6 +16,7 @@
 
 #include <intrin.h>
 #include <windows.h>
+#pragma comment(lib, "Synchronization.lib") // WaitOnAddress
 
 #include "render/presenter.h"
 #include "live_switch.h"
@@ -117,6 +118,9 @@ struct Gpu
 
 Gpu g_gpu;
 bool g_trace = getenv("REGPU_GPUTRACE") != nullptr;
+// Interrupts delivered by the interrupt thread (vblank): the command processor sleeps on this while a
+// wait is for something an interrupt handler releases (REGPU_CP_SLEEP_FOR_INTERRUPTS, WAIT_REG_MEM).
+std::atomic<uint32_t> g_interruptsDelivered{ 0 };
 
 void RaiseInterrupt(uint32_t source, uint32_t cpu)
 {
@@ -612,6 +616,8 @@ void InterruptLoop(PPCContext& ctx)
         }
         for (auto [source, cpu] : sources)
             DispatchInterrupt(ctx, source, cpu);
+        g_interruptsDelivered.fetch_add(1);
+        WakeByAddressAll(&g_interruptsDelivered);
     }
 }
 
@@ -1098,8 +1104,17 @@ uint32_t ExecutePacket(uint32_t ptr)
         // spin, then yield, then sleep.
         const auto start = Clock::now();
         static const int spinMs = getenv("REGPU_CP_SPIN_MS") ? atoi(getenv("REGPU_CP_SPIN_MS")) : 100;
+        // REGPU_CP_SLEEP_FOR_INTERRUPTS: past a short spin and REGPU_CP_YIELD_US (default 100) of
+        // yielding, sleep until the interrupt thread delivers its next interrupt (or 1 ms). A title's
+        // vsync wait is released by its vblank handler (Too Human: the command stream sets a word and
+        // waits for the handler to clear it): it spun through most of each frame, ~0.5 core, and a
+        // plain Sleep(1) noticed the release late (dropped frames). A word a title thread writes is
+        // still seen within 1 ms.
+        static LiveSwitch sleepForInterrupts("REGPU_CP_SLEEP_FOR_INTERRUPTS");
+        static const auto yieldFor = std::chrono::microseconds(getenv("REGPU_CP_YIELD_US") ? atoi(getenv("REGPU_CP_YIELD_US")) : 100);
         for (int tries = 0;; tries++)
         {
+            const uint32_t delivered = g_interruptsDelivered.load(); // before the read: no wake is missed
             const uint32_t value = (info & 0x10) ? ReadBack(arg(1)) : Reg(arg(1));
             if (WaitCompare(info & 7, value & arg(3), arg(2)))
                 break;
@@ -1111,6 +1126,8 @@ uint32_t ExecutePacket(uint32_t ptr)
             }
             if (tries < 200)
                 _mm_pause();
+            else if (sleepForInterrupts && waited >= yieldFor)
+                WaitOnAddress(&g_interruptsDelivered, const_cast<uint32_t*>(&delivered), sizeof(delivered), 1);
             else if (waited < std::chrono::milliseconds(spinMs))
                 SwitchToThread();
             else
