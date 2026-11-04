@@ -9490,6 +9490,17 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
         ~PsAlias() { C().psHash = real; C().vsHash = realVs; }
     } psAlias;
     const CompiledShader& vs = GetShader(C().vsHash, C().vsCode, false);
+    // Memory export (eA/eM) isn't translated and its writes are lost (hlsl.cpp). The first draw with each
+    // such shader is logged, so an ordinary run shows whether a scene uses it (a capture marks every one).
+    if (vs.info.memExport) [[unlikely]]
+    {
+        static std::mutex mutex;
+        static std::unordered_set<uint64_t> seen;
+        std::lock_guard lock(mutex);
+        if (seen.insert(vs.hash).second)
+            Log("renderer: vs %016llx draws with memory export (frame %llu): its writes are dropped", (unsigned long long)vs.hash,
+                (unsigned long long)g_r.frame);
+    }
     if (g_drawStats.load(std::memory_order_relaxed) == 2) // the debug server's drawstats: every draw of a frame
     {
         std::lock_guard lock(g_drawStatsMutex);
