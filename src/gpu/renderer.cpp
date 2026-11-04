@@ -4679,9 +4679,13 @@ bool SkippableDraw(bool depthOnly, uint32_t blend)
     // for later passes to draw through (FH1's minimap came out as white blobs for a moment when the world
     // loaded: 27 such draws were dropped while their pipelines built, the first frame after the load).
     // REGPU_SKIP_PLAIN_RECTS=1: skippable like the rest, as before.
-    if (PlainRectMustDraw())
-        return false;
     const bool opaque = (blend & 0xFF1F1F1F) == 0x00010001 || (blend & 0x1F) == 1 && ((blend >> 8) & 0x1F) == 0;
+    // A blended plain rect is a fade, flash or tint, not a clear: dropped for a frame, it only shows a
+    // frame without the effect. It waited for its pipeline as clears do (Too Human, a first visit to a
+    // level: 21 and 17 ms stalls, both fades). REGPU_MUST_DRAW_BLENDED_RECTS=1: they wait, as before.
+    static LiveSwitch mustDrawBlendedRects("REGPU_MUST_DRAW_BLENDED_RECTS");
+    if (PlainRectMustDraw() && (opaque || mustDrawBlendedRects))
+        return false;
     return !opaque || GameSettled();
 }
 
