@@ -12,6 +12,7 @@
 #include <bit>
 #include <immintrin.h>
 #include <atomic>
+#include <future>
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
@@ -3739,9 +3740,12 @@ uint64_t PsEditAlias(uint64_t hash)
     return it == g_psEditAlias.end() ? hash : it->second;
 }
 
-const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel, bool background);
+const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel, bool background, TranslatedShader* translated);
 // Shaders are never removed: each thread remembers the ones it looked up (no lock per draw).
-const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel, bool background = false)
+// `translated`: this code's TranslateShader result, made ahead (in parallel) by a caller installing
+// many shaders at once; used instead of translating here, under the lock.
+const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel, bool background = false,
+    TranslatedShader* translated = nullptr)
 {
     thread_local std::unordered_map<uint64_t, const CompiledShader*> known;
     // Neighbouring draws mostly use the same shaders: a small direct-mapped table in front of the map
@@ -3767,13 +3771,13 @@ const CompiledShader& GetShader(uint64_t hash, const std::vector<uint32_t>& code
         return *found;
     }
     std::lock_guard shaderLock(g_shaderMutex);
-    const CompiledShader& cs = GetShaderLocked(hash, codeBE, pixel, background);
+    const CompiledShader& cs = GetShaderLocked(hash, codeBE, pixel, background, translated);
     known.emplace(hash, &cs);
     r = { hash, &cs };
     return cs;
 }
 
-const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel, bool background)
+const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>& codeBE, bool pixel, bool background, TranslatedShader* translated)
 {
     auto it = g_r.shaders.find(hash);
     if (it != g_r.shaders.end())
@@ -3839,7 +3843,7 @@ const CompiledShader& GetShaderLocked(uint64_t hash, const std::vector<uint32_t>
                 return cs;
             }
         }
-    cs.info = TranslateShader(parsed);
+    cs.info = translated ? std::move(*translated) : TranslateShader(parsed);
     // Only a translation whose fetches all read vfl can stand in for its patched copies; one
     // with baked fetch fields would hand them the wrong layout.
     if (canonical && cs.info.ok)
@@ -11231,8 +11235,11 @@ void PrecompileAll()
             // phase's progress, not a held black frame.
             const regpu::Host& host = regpu::GetHost();
             std::vector<uint8_t> frame;
+            // Compiling only after a translator change; otherwise the stored set loading from the cache.
+            static bool compiled = false;
+            compiled = compiled || g_compiler.jobs.load() > 0;
             if (now - start > std::chrono::seconds(2) && host.bootScreen &&
-                host.bootScreen(L"COMPILING SHADERS", uint32_t(nextKey), uint32_t(keys.size()), frame))
+                host.bootScreen(compiled ? L"COMPILING SHADERS" : L"LOADING SHADERS", uint32_t(nextKey), uint32_t(keys.size()), frame))
                 BootPresent(frame);
             else
             {
@@ -11267,11 +11274,41 @@ void PrecompileAll()
     const auto staticStart = std::chrono::steady_clock::now();
     size_t queued = 0;
     std::vector<const CompiledShader*> compiling;
-    // The first boot's search of the game files takes a few seconds: say so on screen.
+    // The host's boot screen, redrawn about ten times a second while this waits (a frame shown once
+    // and left there looks like a hang).
     std::vector<uint8_t> bootFrame;
-    if (!(host.staticShadersSaved && host.staticShadersSaved()) && BootScreenCompose(L"PREPARING SHADERS", 0, 0, bootFrame))
-        BootPresent(bootFrame);
-    for (regpu::ScannedShader& s : host.staticShaders())
+    auto lastBootFrame = std::chrono::steady_clock::time_point{};
+    auto ShowBoot = [&](const wchar_t* title, uint32_t done, uint32_t total) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastBootFrame < std::chrono::milliseconds(100))
+            return;
+        lastBootFrame = now;
+        if (BootScreenCompose(title, done, total, bootFrame))
+            BootPresent(bootFrame);
+        else
+        {
+            g_hold.active = true;
+            HoldPresent();
+        }
+    };
+    // The first boot's search of the game files takes a few seconds (later boots load the saved list):
+    // on its own thread, the screen saying so meanwhile.
+    std::vector<regpu::ScannedShader> statics;
+    {
+        const bool searching = !(host.staticShadersSaved && host.staticShadersSaved());
+        auto found = std::async(std::launch::async, [&] { return host.staticShaders(); });
+        while (found.wait_for(std::chrono::milliseconds(5)) != std::future_status::ready)
+            if (searching)
+                ShowBoot(L"PREPARING SHADERS", 0, 0);
+        statics = found.get();
+    }
+    struct Candidate
+    {
+        regpu::ScannedShader* shader;
+        uint64_t hash;
+    };
+    std::vector<Candidate> candidates;
+    for (regpu::ScannedShader& s : statics)
     {
         // Hashed as the upload of it is (RendererPredictShader, frame.cpp): its used dwords only. A host
         // can pass a shader's whole stored microcode (Too Human's shader containers hold a few dwords
@@ -11287,12 +11324,47 @@ void PrecompileAll()
             VertexPatch::AddShipped(hash, s.code);
         if (g_r.shaders.count(hash))
             continue;
+        candidates.push_back({ &s, hash });
+    }
+    // Every one is translated, compiled or not (the translation is what finds its cached bytecode): a few
+    // ms each, ~10,000 of them for Too Human, 34 s on one thread. Translated on every core; installed in
+    // order below as before (REGPU_SERIAL_STATIC_SHADERS=1 translates them there, one by one).
+    std::vector<TranslatedShader> translated(candidates.size());
+    static LiveSwitch serial("REGPU_SERIAL_STATIC_SHADERS");
+    if (!serial && !candidates.empty())
+    {
+        std::atomic<size_t> next{ 0 }, done{ 0 };
+        std::vector<std::thread> pool;
+        const unsigned threads = std::clamp(std::thread::hardware_concurrency(), 1u, 16u);
+        for (unsigned t = 0; t < threads; t++)
+            pool.emplace_back([&] {
+                for (size_t i; (i = next++) < candidates.size(); done++)
+                {
+                    const regpu::ScannedShader& s = *candidates[i].shader;
+                    translated[i] = TranslateShader(ucode::Parse(s.code.data(), uint32_t(s.code.size()), s.pixel));
+                }
+            });
+        while (done.load() < candidates.size())
+        {
+            if (std::chrono::steady_clock::now() - staticStart > std::chrono::milliseconds(500))
+                ShowBoot(L"LOADING SHADERS", uint32_t(done.load()), uint32_t(candidates.size()));
+            Sleep(5);
+        }
+        for (auto& t : pool)
+            t.join();
+    }
+    for (size_t i = 0; i < candidates.size(); i++)
+    {
+        const auto& [s, hash] = candidates[i];
         g_scanKnown.insert(hash);
-        const CompiledShader& cs = GetShader(hash, s.code, s.pixel, true);
+        const CompiledShader& cs = GetShader(hash, s->code, s->pixel, true, serial ? nullptr : &translated[i]);
         if (cs.state.load() == CompiledShader::Pending)
             compiling.push_back(&cs);
         queued++;
+        if (serial && std::chrono::steady_clock::now() - staticStart > std::chrono::milliseconds(500))
+            ShowBoot(L"LOADING SHADERS", uint32_t(i), uint32_t(candidates.size()));
     }
+    translated.clear();
     // The vertex shaders the game makes from them (VertexPatch), as the seed lists them.
     size_t variants = 0, variantLines = 0, fitting = 0;
     if (host.pipelineSeed && !getenv("REGPU_NO_SEED_PIPELINES"))
@@ -11326,6 +11398,7 @@ void PrecompileAll()
     const int toCompile = int(compiling.size());
     Log("static shaders: %zu new, %d to compile (prepared in %.1f s)", queued, toCompile,
         std::chrono::duration<double>(std::chrono::steady_clock::now() - staticStart).count());
+    g_hold.active = false;
     if (!toCompile)
         return;
     g_stats.staticTotal = uint32_t(toCompile);
