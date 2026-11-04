@@ -320,6 +320,19 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     if ((tinfo[slot].x >> 19) & 1u) uv.y = clamp(uv.y, 0.5 / texelSize.y, 1.0 - 0.5 / texelSize.y);
     if (tbias[slot].z > 0.0) uv *= tbias[slot].zw; // declared image inside a wider resolved texture (renderer.cpp)
     uint mode = FetchMode(tinfo[slot].x & 3u);
+    // A rectangle is one primitive on the Xenos, its interpolants one plane: a coordinate exactly on
+    // a texel boundary (a full-screen pass adding half a texel to its pixel-centre coordinates, at any
+    // render scale) lands on the same side of it everywhere. Here it is two triangles, each rounding
+    // its interpolants its own way, and a point fetch took the texel either side of the boundary in
+    // each: the picture shifted a pixel along the shared diagonal (Too Human's gameplay frame). Point
+    // fetches snap the coordinate to 1/256 of a host texel first, so both triangles agree (pinfo.z
+    // bit 17, REGPU_NO_POINT_SNAP).
+    if (!vertexStage && (mode == 2u || mode == 3u) && (pinfo.z & 131072u))
+    {
+        float2 dim;
+        t.GetDimensions(dim.x, dim.y);
+        uv = round(uv * dim * 256.0) / (dim * 256.0);
+    }
     // Vertex shaders read data tables this way (PGR4's riders: bone matrices, three texels a bone):
     // the fetch constant's filter applies, point sampling exactly one texel. Always linear here,
     // each matrix row was blended with its neighbours and the bodies came out mangled.

@@ -10307,6 +10307,10 @@ void DrawImpl(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize)
     // Bit 16 (bit 6 is the alpha dither). REGPU_OLD_PIXEL_POS=1: the centre (A/B).
     if (static LiveSwitch oldPixelPos("REGPU_OLD_PIXEL_POS"); !oldPixelPos)
         pc->info[2] |= 1u << 16;
+    // Point-sampled coordinates snapped to 1/256 of a texel (hlsl.cpp, TFetchRaw). Bit 17.
+    // REGPU_NO_POINT_SNAP=1: as sampled (A/B).
+    if (static LiveSwitch noPointSnap("REGPU_NO_POINT_SNAP"); !noPointSnap)
+        pc->info[2] |= 1u << 17;
     // HUD and menus sample ordinary textures; full-screen layers sample resolved targets
     // and must keep spanning the width (squeezing them warped the image outside 16:9).
     vc->vwide[3] = g_drawSamplesResolve ? 0.0f : 1.0f;
