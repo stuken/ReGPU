@@ -1737,7 +1737,9 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
     if (g_msaa > 1)
     {
         // The same passes reading a multisampled surface: depth takes sample 0, colour averages all samples.
-        const std::string msSource = "#define SAMPLES " + std::to_string(g_msaa) + R"(
+        // REGPU_MSAA_VIZ=1 (debug): colour resolves paint pixels whose samples differ bright red (where MSAA
+        // has edges to smooth), to see whether a pass's draws reach the samples.
+        const std::string msSource = "#define SAMPLES " + std::to_string(g_msaa) + (getenv("REGPU_MSAA_VIZ") ? "\n#define MSAA_VIZ 1" : "") + R"(
 Texture2DMS<float, SAMPLES> depthMs : register(t0);
 Texture2DMS<float4, SAMPLES> colorMs : register(t0);
 cbuffer Blit : register(b0) { float scale; uint swapRB; uint clampDest; float destMin; float destMax; uint toGamma; };
@@ -1773,6 +1775,15 @@ float4 psColor(float4 pos : SV_Position) : SV_Target
     [unroll] for (int i = 0; i < SAMPLES; i++)
         c += colorMs.Load(int2(pos.xy), i);
     c = c / SAMPLES * scale;
+#ifdef MSAA_VIZ
+    {
+        const float4 s0 = colorMs.Load(int2(pos.xy), 0);
+        bool differ = false;
+        [unroll] for (int i = 1; i < SAMPLES; i++)
+            differ = differ || any(abs(colorMs.Load(int2(pos.xy), i) - s0) > 0.002);
+        if (differ) return float4(4, 0, 0, 1);
+    }
+#endif
     if (clampDest) c = clamp(c, destMin, destMax);
     if (toGamma & 1u) c.rgb = float3(LinearToPWLGamma(c.r), LinearToPWLGamma(c.g), LinearToPWLGamma(c.b));
     if (toGamma & 2u) c.a = round(saturate(c.a) * 3.0) / 3.0; // a 2-bit alpha destination (k_2_10_10_10)
