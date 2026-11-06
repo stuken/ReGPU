@@ -75,7 +75,15 @@ void GammaMain(uint3 id : SV_DispatchThreadID)
     [unroll] for (uint k = 0; k < 17; k++)
         p[k] = asfloat(q[k / 4][k % 4]);
     const float4 c = src.Load(int3(id.xy, 0));
-    dst[id.xy] = float4(GammaCurve(c.r, p), GammaCurve(c.g, p), GammaCurve(c.b, p), c.a);
+    float3 g = float3(GammaCurve(c.r, p), GammaCurve(c.g, p), GammaCurve(c.b, p));
+    // outSize.z bit 0: the source has more than 8 bits; dither to the 8-bit output (interleaved
+    // gradient noise, fixed per pixel, +-half a step) so the steps between output levels don't band.
+    if (outSize.z & 1u)
+    {
+        const float n = frac(52.9829189 * frac(dot(float2(id.xy), float2(0.06711056, 0.00583715))));
+        g = saturate(g + (n - 0.5) / 255.0);
+    }
+    dst[id.xy] = float4(g, c.a);
 }
 
 // Enhanced lighting (experimental): local contrast on the finished frame. rcasCon.x is the

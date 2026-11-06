@@ -6659,22 +6659,30 @@ std::atomic<bool> g_gammaSet{ false };
 std::atomic<uint32_t> g_gammaPwl[128][3];
 std::atomic<bool> g_gammaPwlSet{ false };
 ComPtr<ID3D12Resource> g_gammaOut;
+D3D12_RESOURCE_STATES g_gammaOutState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 ComPtr<ID3D12Resource> g_enhanceOut; // enhanced lighting output (Settings::enhance)
 
-// Returns the graded copy of `image` (in COPY_SOURCE state), or null to show it as is. `pwl`: the
+// Returns the graded copy of `image` (in COPY_SOURCE state, 8-bit), or null to show it as is. `pwl`: the
 // front buffer is k_2_10_10_10, so the display uses the PWL ramp. REGPU_NO_GAMMA_PWL=1: always the table.
+// A front buffer wider than 8 bits (a k_2_10_10_10 one, kept in half floats) is always converted, through an
+// identity ramp if there is none, and dithered to 8 bits so the steps between its levels don't show as
+// bands (REGPU_NO_PRESENT_DITHER=1: rounded). Null for it means nothing presentable this frame.
 ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl)
 {
-    static LiveSwitch off("REGPU_NO_GAMMA"), noPwl("REGPU_NO_GAMMA_PWL");
+    static LiveSwitch off("REGPU_NO_GAMMA"), noPwl("REGPU_NO_GAMMA_PWL"), noDither("REGPU_NO_PRESENT_DITHER");
+    const bool wide = image->GetDesc().Format != DXGI_FORMAT_R8G8B8A8_UNORM;
     pwl = pwl && !noPwl && g_gammaPwlSet.load(std::memory_order_relaxed);
-    if (off || (!pwl && !g_gammaSet.load(std::memory_order_relaxed)) || !InitUpscale())
+    const bool ramp = !off && (pwl || g_gammaSet.load(std::memory_order_relaxed));
+    if ((!ramp && !wide) || !InitUpscale())
         return nullptr;
     // 17 points of the ramp (green; the title writes equal channels), at x = k/16.
     float points[17];
     bool identity = true;
     for (uint32_t k = 0; k <= 16; k++)
     {
-        if (pwl)
+        if (!ramp)
+            points[k] = k / 16.0f;
+        else if (pwl)
         {
             // A 10-bit value: its top 7 bits pick the entry, its low 3 step along the delta
             // (base and delta are 16-bit, bits 0-5 zero).
@@ -6699,7 +6707,7 @@ ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl)
         h = (h ^ uint32_t(pt * 65535.0f)) * 0x100000001B3ull;
     if (loggedHash.exchange(h) != h && logs++ < 4)
         Log("gamma: display ramp (%s): %.3f %.3f %.3f %.3f %.3f ... %.3f", pwl ? "PWL" : "table", points[0], points[1], points[2], points[4], points[8], points[16]);
-    if (identity)
+    if (identity && !wide)
         return nullptr;
     const D3D12_RESOURCE_DESC desc = image->GetDesc();
     FrameResources& f = Frame();
@@ -6713,11 +6721,23 @@ ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl)
         td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         RetireTexture(std::move(g_gammaOut));
         g_gammaOut = CreateTexture(td, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "gamma");
+        g_gammaOutState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+    else if (g_gammaOutState != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+    {
+        // Last frame's copy, left as a copy source.
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = g_gammaOut.Get();
+        b.Transition.StateBefore = g_gammaOutState;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        C().list->ResourceBarrier(1, &b);
+        g_gammaOutState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     }
     const UINT slots = f.descriptorBase + f.descriptorsUsed;
     f.descriptorsUsed += 2;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srv.Format = desc.Format;
     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels = 1;
@@ -6730,6 +6750,7 @@ ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl)
     memcpy(c, points, sizeof(points));
     c[20] = uint32_t(desc.Width);
     c[21] = desc.Height;
+    c[22] = wide && !noDither ? 1u : 0u; // GammaMain: dither to 8 bits
     C().list->SetComputeRootSignature(g_upscale.root.Get());
     C().list->SetComputeRoot32BitConstants(0, 24, c, 0);
     C().list->SetPipelineState(g_upscale.gamma.Get());
@@ -6742,6 +6763,7 @@ ID3D12Resource* GradeFrontBuffer(ID3D12Resource* image, bool pwl)
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     C().list->ResourceBarrier(1, &b);
+    g_gammaOutState = D3D12_RESOURCE_STATE_COPY_SOURCE;
     g_drawState.Invalidate(); // the compute pipeline replaced the draw's
     return g_gammaOut.Get();
 }
@@ -7132,15 +7154,17 @@ void Resolve()
             height = it->second.height;
         // Destination: 8888 stays 8-bit (clamped, as the hardware does); other
         // formats keep the HDR range. The exponent bias scales colour copies.
-        // k_2_10_10_10 (7) is a fixed-point front-buffer format too (PGR4 presents one); it gets the same
-        // presentable 8-bit host image, losing its low two bits. Only unscaled, though: a copy with an
-        // exponent bias stores HDR scaled down (FH1's reflections at 1/16, sampled back with the fetch's
-        // exponent adjust), and 8 bits of that came out as a colour cast (green car glass); those keep
-        // the HDR range. REGPU_NO_1010102_AS_8888 keeps every one HDR.
-        static LiveSwitch no1010102("REGPU_NO_1010102_AS_8888");
+        // k_2_10_10_10 (7) is a fixed-point front-buffer format too (PGR4 and Too Human present one). It
+        // keeps its 10 bits in half floats (clamped to 0-1 as the hardware stores it, kUnorm below): as
+        // 8 bits it lost its low two, and the display's gamma ramp then spread the dark end into visible
+        // steps (Too Human's dark scenes banded; the console ramps the 10-bit values). The present path
+        // grades and dithers it down to the 8-bit swap chain (GradeFrontBuffer). A copy with an exponent
+        // bias stores HDR scaled down (FH1's reflections at 1/16) and keeps the HDR range either way.
+        // REGPU_1010102_AS_8888=1: unscaled ones 8-bit, as before.
+        static LiveSwitch as8888("REGPU_1010102_AS_8888");
         const int bias = int32_t(info << 10) >> 26; // bits 16-21, signed
         const DXGI_FORMAT format = depth ? DXGI_FORMAT_R32_FLOAT
-            : destFormat == 6 || (destFormat == 7 && bias == 0 && !no1010102) ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
+            : destFormat == 6 || (destFormat == 7 && bias == 0 && as8888) ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R16G16B16A16_FLOAT;
         // Bit 24 (copy swap): the destination stores red and blue exchanged; the
         // fetch swizzle swaps them back when the title samples it.
         const bool swapRB = !depth && ((info >> 24) & 1);
@@ -7433,6 +7457,7 @@ struct Hold
 {
     bool active = false;
     ComPtr<ID3D12Resource> image; // last frame shown (kept alive here)
+    D3D12_RESOURCE_STATES imageState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> list;
     ComPtr<ID3D12Resource> upload;
@@ -7845,12 +7870,15 @@ void HoldPresent()
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = g_hold.image.Get();
     b.Transition.Subresource = 0;
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateBefore = g_hold.imageState;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    g_hold.list->ResourceBarrier(1, &b);
+    const bool transition = g_hold.imageState != D3D12_RESOURCE_STATE_COPY_SOURCE;
+    if (transition)
+        g_hold.list->ResourceBarrier(1, &b);
     const bool ok = PresenterRecordCopy(g_hold.list.Get(), g_hold.image.Get(), overlay, kOverlayW, kOverlayH);
     std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
-    g_hold.list->ResourceBarrier(1, &b);
+    if (transition)
+        g_hold.list->ResourceBarrier(1, &b);
     g_hold.list->Close();
     if (!ok)
         return;
@@ -11516,7 +11544,8 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
     D3D12_RESOURCE_STATES imageState = D3D12_RESOURCE_STATE_COPY_SOURCE;
     auto it = g_r.resolved.find(frontBuffer);
     const bool fromResolve = it != g_r.resolved.end() && it->second.width == kWidth && it->second.height == kHeight &&
-        it->second.format == DXGI_FORMAT_R8G8B8A8_UNORM;
+        (it->second.format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+            (it->second.format == DXGI_FORMAT_R16G16B16A16_FLOAT && it->second.guestFormat == 7));
     ID3D12Resource* graded = nullptr; // the front buffer through the display's gamma table
     if (fromResolve)
     {
@@ -11530,16 +11559,23 @@ void RendererOnSwapImpl(uint64_t frameNumber, uint32_t frontBuffer)
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
         C().list->ResourceBarrier(1, &b);
     }
-    // The render target is half float; without an 8-bit resolve there is
-    // nothing presentable this frame.
-    if (fromResolve)
-        g_hold.image = it->second.resource;
+    // The render target is half float; without an 8-bit resolve (or a 10-bit one, graded to 8 bits)
+    // there is nothing presentable this frame.
     ID3D12Resource* overlay = fromResolve ? PrepareOverlay() : nullptr;
     ID3D12Resource* shown = graded ? graded : image;
     if (fromResolve)
         if (ID3D12Resource* enhanced = EnhanceFrontBuffer(shown))
             shown = enhanced;
-    const bool presenting = fromResolve && PresenterRecordCopy(C().list->Real(), shown, overlay, kOverlayW, kOverlayH);
+    const bool presentable = fromResolve && shown->GetDesc().Format == DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (presentable)
+    {
+        // The hold repeats what was shown: the 8-bit resolve itself, or (a wide front buffer) its graded copy.
+        const bool own = shown == image;
+        g_hold.image = own ? it->second.resource : ComPtr<ID3D12Resource>(shown);
+        g_hold.imageState = own ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                : D3D12_RESOURCE_STATE_COPY_SOURCE;
+    }
+    const bool presenting = presentable && PresenterRecordCopy(C().list->Real(), shown, overlay, kOverlayW, kOverlayH);
     {
         const uint64_t traceFrame = TraceFrame();
         if (traceFrame && g_r.frame + 1 == traceFrame)
