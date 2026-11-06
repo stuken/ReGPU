@@ -324,14 +324,22 @@ float4 TFetchRaw(uint slot, float3 coord, bool denorm, bool vertexStage, float b
     // a texel boundary (a full-screen pass adding half a texel to its pixel-centre coordinates, at any
     // render scale) lands on the same side of it everywhere. Here it is two triangles, each rounding
     // its interpolants its own way, and a point fetch took the texel either side of the boundary in
-    // each: the picture shifted a pixel along the shared diagonal (Too Human's gameplay frame). Point
-    // fetches snap the coordinate to 1/256 of a host texel first, so both triangles agree (pinfo.z
+    // each: the picture shifted a pixel along the shared diagonal (Too Human's gameplay frame). The
+    // interpolation error grows with the render scale (about 4/256 of a host texel at 3x), so rounding to
+    // 1/256 of a texel no longer brought both sides together: whole rows and columns took the other texel,
+    // each duplicating or skipping one, and every edge they crossed lost its anti-aliasing (stair steps,
+    // gameplay only). A point fetch within 1/16 of a texel of a boundary is put on it and nudged 1/512
+    // back, into the texel the boundary ends, which every pixel then takes: the one Xenia shows (its
+    // frame lines up with this one; nudged forward the picture sat a pixel up and left of it) (pinfo.z
     // bit 17, REGPU_NO_POINT_SNAP).
     if (!vertexStage && (mode == 2u || mode == 3u) && (pinfo.z & 131072u))
     {
         float2 dim;
         t.GetDimensions(dim.x, dim.y);
-        uv = round(uv * dim * 256.0) / (dim * 256.0);
+        float2 at = uv * dim;
+        const float2 edge = round(at);
+        at = abs(at - edge) < 1.0 / 16.0 ? edge - 1.0 / 512.0 : at;
+        uv = at / dim;
     }
     // Vertex shaders read data tables this way (PGR4's riders: bone matrices, three texels a bone):
     // the fetch constant's filter applies, point sampling exactly one texel. Always linear here,
